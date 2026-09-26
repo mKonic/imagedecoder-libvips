@@ -89,6 +89,10 @@ ProcessorCount(NPROC)
 if(NPROC EQUAL 0)
     set(NPROC 4)
 endif()
+# A fixed ceiling for machines where every sub-build running at nproc would exhaust memory.
+if(DEFINED ENV{IMAGEDECODER_JOBS})
+    set(NPROC $ENV{IMAGEDECODER_JOBS})
+endif()
 
 # Common args to all Mason ExternalProjects
 set(EP_MESON_ARGS "--cross-file=${MESON_CROSS_FILE_PATH}"
