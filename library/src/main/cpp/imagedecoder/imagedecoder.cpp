@@ -2093,11 +2093,24 @@ Java_ca_mpreg_imagedecoder_ImageDecoder_nativeFrames(JNIEnv* env, jobject obj)
     if (!f->buffer)
       fail(EXC_OOM, "Out of memory holding the frame buffer");
 
+    /* The delays the header gave, as decode() reports them: missing ones are 0, negatives 0. */
+    jintArray durations = env->NewIntArray(f->pages);
+    if (!durations || env->ExceptionCheck()) {
+      if (env->ExceptionCheck())
+        env->ExceptionClear();
+      fail(EXC_OOM, "Out of memory holding the frame durations");
+    }
+    LocalRef durations_ref(env, durations);
+    std::vector<jint> delays(f->pages, 0);
+    for (int i = 0; i < f->pages && decoder->durations && i < decoder->durations_count; i++)
+      delays[i] = decoder->durations[i] < 0 ? 0 : decoder->durations[i];
+    env->SetIntArrayRegion(durations, 0, f->pages, delays.data());
+
     jclass cls = find_class_checked(env, "ca/mpreg/imagedecoder/FrameDecoder");
     LocalRef cls_ref(env, cls);
-    jmethodID ctor = get_method_checked(env, cls, "<init>", "(JIIILjava/nio/ByteBuffer;)V");
+    jmethodID ctor = get_method_checked(env, cls, "<init>", "(JIIILjava/nio/ByteBuffer;[I)V");
     jobject result = env->NewObject(cls, ctor, reinterpret_cast<jlong>(f), f->width, f->page_height,
-                                    f->pages, f->buffer);
+                                    f->pages, f->buffer, durations);
     if (!result || env->ExceptionCheck()) {
       if (env->ExceptionCheck())
         env->ExceptionClear();

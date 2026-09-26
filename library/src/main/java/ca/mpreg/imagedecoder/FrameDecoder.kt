@@ -20,6 +20,8 @@ class FrameDecoder private constructor(
     val height: Int,
     val frameCount: Int,
     val image: ByteBuffer,
+    /** Each frame's delay in milliseconds, as [ImageDecoder.DecodeResult.duration] gives it. */
+    val durations: IntArray,
 ) : Closeable {
     private val closed = AtomicBoolean(false)
 

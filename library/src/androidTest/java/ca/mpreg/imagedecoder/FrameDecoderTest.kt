@@ -31,6 +31,8 @@ class FrameDecoderTest {
             assertNotNull("$name has no frame decoder", frames)
             frames!!
             assertEquals(decoder.pages, frames.frameCount)
+            val expectedDurations = (0 until decoder.pages).map { decoder.decode(it).duration }
+            assertEquals(expectedDurations, frames.durations.toList())
             // Twice round, so the wrap back to the first frame is covered.
             for (round in 0 until 2) {
                 for (i in 0 until frames.frameCount) {
