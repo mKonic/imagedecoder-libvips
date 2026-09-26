@@ -145,6 +145,17 @@ class ImageDecoder private constructor(
 
     open class DecodeException internal constructor(message: String) : Exception(message)
 
+    /** What [open] made of a stream. */
+    sealed class Opened : Closeable {
+        class Rows(val decoder: RowDecoder) : Opened() {
+            override fun close() = decoder.close()
+        }
+
+        class Whole(val decoder: ImageDecoder) : Opened() {
+            override fun close() = decoder.close()
+        }
+    }
+
     class UnknownFormatException internal constructor(message: String) : DecodeException(message)
 
     /**
@@ -309,5 +320,28 @@ class ImageDecoder private constructor(
 
         @JvmStatic
         private external fun nativeNew(inputStream: InputStream): ImageDecoder
+
+        /**
+         * Reads only [inputStream]'s header, then hands back a [RowDecoder] if the image can be
+         * decoded top to bottom as the rest arrives: a still 8-bit JPEG or PNG with no gainmap,
+         * rotation or HDR signal. Anything else is read to the end and comes back as an
+         * [ImageDecoder], exactly as [new] would have made it.
+         *
+         * A [RowDecoder] keeps reading [inputStream] until its last row, so the stream must stay
+         * open until then. Either way the caller closes it.
+         *
+         * @throws OutOfMemoryException if the image is larger than the decoder will buffer.
+         * @throws UnknownFormatException if the bytes are not a supported image.
+         */
+        @JvmStatic
+        @Throws(DecodeException::class)
+        fun open(inputStream: InputStream): Opened = when (val o = nativeOpenRows(inputStream)) {
+            is RowDecoder -> Opened.Rows(o)
+            is ImageDecoder -> Opened.Whole(o)
+            else -> throw DecodeException("Unexpected decoder type")
+        }
+
+        @JvmStatic
+        private external fun nativeOpenRows(inputStream: InputStream): Any
     }
 }

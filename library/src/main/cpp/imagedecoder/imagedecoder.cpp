@@ -537,6 +537,9 @@ allocate_direct(JNIEnv* env, size_t size, void** out_data)
   return buffer;
 }
 
+static jobject
+decoder_object(JNIEnv* env, Decoder* decoder);
+
 extern "C" JNIEXPORT jobject JNICALL
 Java_ca_mpreg_imagedecoder_ImageDecoder_nativeNew(JNIEnv* env, jclass, jobject jstream)
 {
@@ -563,6 +566,14 @@ Java_ca_mpreg_imagedecoder_ImageDecoder_nativeNew(JNIEnv* env, jclass, jobject j
     return nullptr;
   }
 
+  return decoder_object(env, decoder);
+}
+
+/* Parses [decoder]'s buffer and wraps it in an ImageDecoder, which then owns it. Frees it and
+ * leaves an exception pending on failure. */
+static jobject
+decoder_object(JNIEnv* env, Decoder* decoder)
+{
   try {
     vips::VImage image = vips::VImage::new_from_buffer(decoder->buffer, decoder->buffer_size, "");
 
@@ -1349,4 +1360,399 @@ Java_ca_mpreg_imagedecoder_ImageDecoder_00024EncodeResult_nativeFree(JNIEnv* env
   if (ptr == 0)
     return;
   g_free((void*)(intptr_t)ptr);
+}
+
+/* ------------------------------------------------------------ row decoding
+ *
+ * A still image decoded top to bottom while its bytes are still arriving. libvips reads the
+ * stream through a custom source only as far as the rows asked for need, so a baseline JPEG or
+ * a non-interlaced PNG hands its first rows back long before the file has finished downloading.
+ * Anything that cannot come out that way is read to the end and handed back as an ImageDecoder. */
+
+static const jint ROW_CHUNK = 64 * 1024;
+
+struct RowStream
+{
+  /* Of the JNI call in progress: the read callback only ever runs inside one. */
+  JNIEnv* env;
+  jobject stream;
+  jmethodID read;
+  jbyteArray chunk;
+  bool failed;
+  guint64 total;
+
+  /* Every byte read so far, while a whole-file decode may still need them. */
+  bool tee;
+  uint8_t* data;
+  size_t len;
+  size_t cap;
+};
+
+struct RowDecoder
+{
+  RowStream in;
+  VipsSourceCustom* source;
+  VipsImage* image;
+  VipsRegion* region;
+  int width;
+  int height;
+  int rows_done;
+  uint8_t* out;
+  jobject buffer;
+};
+
+static void
+row_stream_release(JNIEnv* env, RowStream* s)
+{
+  if (s->stream)
+    env->DeleteGlobalRef(s->stream);
+  if (s->chunk)
+    env->DeleteGlobalRef(s->chunk);
+  s->stream = nullptr;
+  s->chunk = nullptr;
+  g_free(s->data);
+  s->data = nullptr;
+  s->len = s->cap = 0;
+}
+
+static void
+row_decoder_free(JNIEnv* env, RowDecoder* d)
+{
+  if (!d)
+    return;
+  if (d->region)
+    g_object_unref(d->region);
+  if (d->image)
+    g_object_unref(d->image);
+  if (d->source)
+    g_object_unref(d->source);
+  if (d->buffer)
+    env->DeleteGlobalRef(d->buffer);
+  row_stream_release(env, &d->in);
+  g_free(d);
+}
+
+static bool
+tee_append(RowStream* s, const void* bytes, size_t n)
+{
+  if (s->len + n > s->cap) {
+    size_t want = s->cap ? s->cap * 2 : (size_t)ROW_CHUNK * 4;
+    while (want < s->len + n)
+      want *= 2;
+    uint8_t* grown = (uint8_t*)g_try_realloc(s->data, want);
+    if (!grown)
+      return false;
+    s->data = grown;
+    s->cap = want;
+  }
+  memcpy(s->data + s->len, bytes, n);
+  s->len += n;
+  return true;
+}
+
+/* -1 is an error to libvips, 0 the end of the stream. */
+static gint64
+row_stream_read(VipsSourceCustom*, void* buf, gint64 length, void* user)
+{
+  RowStream* s = (RowStream*)user;
+  JNIEnv* env = s->env;
+  if (!env || s->failed || length <= 0)
+    return -1;
+
+  jint want = (jint)VIPS_MIN(length, (gint64)ROW_CHUNK);
+  jint n = env->CallIntMethod(s->stream, s->read, s->chunk, 0, want);
+  if (env->ExceptionCheck()) {
+    env->ExceptionClear();
+    s->failed = true;
+    return -1;
+  }
+  if (n <= 0)
+    return 0;
+  /* A stream lying about how much it wrote would otherwise drive an overread. */
+  if (n > want) {
+    s->failed = true;
+    return -1;
+  }
+
+  s->total += (guint64)n;
+  if (s->total > (guint64)MAX_INPUT_BYTES) {
+    s->failed = true;
+    return -1;
+  }
+
+  env->GetByteArrayRegion(s->chunk, 0, n, (jbyte*)buf);
+  if (s->tee && !tee_append(s, buf, (size_t)n)) {
+    s->failed = true;
+    return -1;
+  }
+  return n;
+}
+
+/* Reads what is left of the stream into the tee. */
+static void
+row_stream_drain(RowStream* s)
+{
+  std::vector<uint8_t> buf(ROW_CHUNK);
+  while (true) {
+    gint64 n = row_stream_read(nullptr, buf.data(), ROW_CHUNK, s);
+    if (n == 0)
+      return;
+    if (n < 0)
+      fail(s->total > (guint64)MAX_INPUT_BYTES ? EXC_OOM : EXC_DECODE,
+           s->total > (guint64)MAX_INPUT_BYTES ? "Out of memory: image exceeds the maximum input size"
+                                              : "InputStream.read failed");
+  }
+}
+
+/* Whether [image] comes out of the plain 8-bit path unchanged in a top-to-bottom pass: no second
+ * frame, gainmap, rotation or HDR signal, from a loader that decodes row by row. */
+static bool
+rows_possible(vips::VImage& image, const RowStream& in)
+{
+  const char* loader = image.get_typeof("vips-loader") != 0 ? image.get_string("vips-loader") : "";
+  if (!loader || (strncmp(loader, "jpegload", 8) != 0 && strncmp(loader, "pngload", 7) != 0))
+    return false;
+  if (image.get_typeof(VIPS_META_N_PAGES) != 0 && image.get_int(VIPS_META_N_PAGES) > 1)
+    return false;
+  if (has_gainmap(image))
+    return false;
+  if (image.get_typeof(VIPS_META_ORIENTATION) != 0 && image.get_int(VIPS_META_ORIENTATION) > 1)
+    return false;
+  if (image.format() != VIPS_FORMAT_UCHAR)
+    return false;
+  if (image.bands() < 1 || image.bands() > 4)
+    return false;
+
+  /* A PNG's cICP chunk sits before its pixels, so the bytes read for the header carry it. */
+  ColourSignal signal;
+  float peak = 0.0f;
+  if (in.data && hdr_find_colour_signal(in.data, in.len, &signal, &peak) &&
+      hdr_kind_for_transfer(signal.transfer) != HDR_NONE)
+    return false;
+
+  return true;
+}
+
+extern "C" JNIEXPORT jobject JNICALL
+Java_ca_mpreg_imagedecoder_ImageDecoder_nativeOpenRows(JNIEnv* env, jclass, jobject jstream)
+{
+  if (!jstream) {
+    throw_decode_error(env, EXC_DECODE, "Input stream is null");
+    return nullptr;
+  }
+
+  RowDecoder* d = g_try_new0(RowDecoder, 1);
+  if (!d) {
+    throw_decode_error(env, EXC_OOM, "Out of memory creating the decoder");
+    return nullptr;
+  }
+  d->in.env = env;
+  d->in.tee = true;
+
+  Decoder* whole = nullptr;
+  jobject result = nullptr;
+
+  try {
+    jclass stream_cls = env->GetObjectClass(jstream);
+    LocalRef stream_cls_ref(env, stream_cls);
+    d->in.read = get_method_checked(env, stream_cls, "read", "([BII)I");
+    d->in.stream = env->NewGlobalRef(jstream);
+    jbyteArray chunk = env->NewByteArray(ROW_CHUNK);
+    if (!chunk || env->ExceptionCheck()) {
+      if (env->ExceptionCheck())
+        env->ExceptionClear();
+      fail(EXC_OOM, "Out of memory allocating the read buffer");
+    }
+    d->in.chunk = (jbyteArray)env->NewGlobalRef(chunk);
+    env->DeleteLocalRef(chunk);
+    if (!d->in.stream || !d->in.chunk)
+      fail(EXC_OOM, "Out of memory holding the stream");
+
+    /* No seek handler: libvips treats the source as a pipe and buffers only what sniffing needs. */
+    d->source = vips_source_custom_new();
+    if (!d->source)
+      throw vips::VError();
+    g_signal_connect(d->source, "read", G_CALLBACK(row_stream_read), &d->in);
+
+    VipsImage* raw = vips_image_new_from_source(VIPS_SOURCE(d->source), "", "access",
+                                                VIPS_ACCESS_SEQUENTIAL, nullptr);
+    if (!raw)
+      throw vips::VError();
+    vips::VImage image(raw, vips::STEAL);
+
+    check_dimensions(image.width(), image.height());
+
+    if (!rows_possible(image, d->in)) {
+      /* The header read already took the first bytes; the tee holds them for the whole decode. */
+      image = vips::VImage();
+      row_stream_drain(&d->in);
+
+      whole = decoder_new();
+      if (!whole)
+        fail(EXC_OOM, "Out of memory creating the decoder");
+      whole->buffer = d->in.data;
+      whole->buffer_size = d->in.len;
+      d->in.data = nullptr;
+      row_decoder_free(env, d);
+      d = nullptr;
+
+      Decoder* owned = whole;
+      whole = nullptr;
+      return decoder_object(env, owned);
+    }
+
+    /* Rows from here on are decoded straight through; nothing needs the bytes again. */
+    d->in.tee = false;
+    g_free(d->in.data);
+    d->in.data = nullptr;
+    d->in.len = d->in.cap = 0;
+
+    vips::VImage frame = to_srgb_primaries(image);
+    if (frame.interpretation() != VIPS_INTERPRETATION_sRGB)
+      frame = frame.colourspace(VIPS_INTERPRETATION_sRGB);
+    if (frame.bands() < 4)
+      frame = frame.bandjoin(255);
+    if (frame.bands() > 4)
+      frame = frame.extract_band(0, vips::VImage::option()->set("n", 4));
+    if (frame.format() != VIPS_FORMAT_UCHAR)
+      frame = frame.cast(VIPS_FORMAT_UCHAR);
+
+    d->width = frame.width();
+    d->height = frame.height();
+    check_dimensions(d->width, d->height);
+
+    d->image = frame.get_image();
+    g_object_ref(d->image);
+    d->region = vips_region_new(d->image);
+    if (!d->region)
+      throw vips::VError();
+
+    const size_t size = checked_buffer_size((guint64)d->width * (guint64)d->height, 4);
+    void* data = nullptr;
+    jobject buffer = allocate_direct(env, size, &data);
+    d->out = (uint8_t*)data;
+    d->buffer = env->NewGlobalRef(buffer);
+    if (!d->buffer) {
+      env->DeleteLocalRef(buffer);
+      fail(EXC_OOM, "Out of memory holding the pixel buffer");
+    }
+
+    const char* loader = image.get_string("vips-loader");
+    jstring jloader = env->NewStringUTF(loader ? loader : "");
+    if (!jloader || env->ExceptionCheck()) {
+      if (env->ExceptionCheck())
+        env->ExceptionClear();
+      env->DeleteLocalRef(buffer);
+      fail(EXC_OOM, "Out of memory creating the loader name");
+    }
+    LocalRef loader_ref(env, jloader);
+
+    jclass cls = find_class_checked(env, "ca/mpreg/imagedecoder/RowDecoder");
+    LocalRef cls_ref(env, cls);
+    jmethodID ctor =
+      get_method_checked(env, cls, "<init>", "(JIILjava/nio/ByteBuffer;Ljava/lang/String;)V");
+
+    d->in.env = nullptr;
+    result = env->NewObject(cls, ctor, reinterpret_cast<jlong>(d), d->width, d->height, buffer,
+                            jloader);
+    env->DeleteLocalRef(buffer);
+    if (!result || env->ExceptionCheck()) {
+      if (env->ExceptionCheck())
+        env->ExceptionClear();
+      if (result)
+        env->DeleteLocalRef(result);
+      result = nullptr;
+      fail(EXC_OOM, "Out of memory creating the decoder object");
+    }
+    return result;
+  } catch (const DecodeError& e) {
+    decoder_free(whole);
+    row_decoder_free(env, d);
+    throw_decode_error(env, e.cls, e.msg.c_str());
+    return nullptr;
+  } catch (const vips::VError& e) {
+    const bool stream_failed = d && d->in.failed;
+    decoder_free(whole);
+    row_decoder_free(env, d);
+    if (stream_failed) {
+      vips_error_clear();
+      throw_decode_error(env, EXC_DECODE, "InputStream.read failed");
+    } else {
+      throw_vips_error(env, e);
+    }
+    return nullptr;
+  } catch (const std::bad_alloc&) {
+    decoder_free(whole);
+    row_decoder_free(env, d);
+    vips_error_clear();
+    throw_decode_error(env, EXC_OOM, "Out of memory reading the image header");
+    return nullptr;
+  } catch (...) {
+    decoder_free(whole);
+    row_decoder_free(env, d);
+    vips_error_clear();
+    throw_decode_error(env, EXC_DECODE, "Unknown error reading the image header");
+    return nullptr;
+  }
+}
+
+/* Decodes up to [max_rows] more rows into the buffer, blocking on the stream for their bytes.
+ * Returns the rows decoded in total. */
+extern "C" JNIEXPORT jint JNICALL
+Java_ca_mpreg_imagedecoder_RowDecoder_nativeDecodeRows(JNIEnv* env, jobject obj, jint max_rows)
+{
+  RowDecoder* d = reinterpret_cast<RowDecoder*>(get_ptr(env, obj));
+  if (!d) {
+    throw_decode_error(env, EXC_DECODE, "RowDecoder has been closed");
+    return 0;
+  }
+  if (d->rows_done >= d->height || max_rows <= 0)
+    return d->rows_done;
+
+  d->in.env = env;
+  try {
+    const int y = d->rows_done;
+    const int n = VIPS_MIN(max_rows, d->height - y);
+    VipsRect rect = { 0, y, d->width, n };
+    if (vips_region_prepare(d->region, &rect))
+      throw vips::VError();
+
+    const size_t row_bytes = (size_t)d->width * 4;
+    for (int i = 0; i < n; i++)
+      memcpy(d->out + (size_t)(y + i) * row_bytes, VIPS_REGION_ADDR(d->region, 0, y + i), row_bytes);
+    d->rows_done = y + n;
+  } catch (const vips::VError& e) {
+    d->in.env = nullptr;
+    if (d->in.failed) {
+      vips_error_clear();
+      throw_decode_error(env, EXC_DECODE, "InputStream.read failed");
+    } else {
+      throw_vips_error(env, e);
+    }
+    return d->rows_done;
+  } catch (...) {
+    d->in.env = nullptr;
+    vips_error_clear();
+    throw_decode_error(env, EXC_DECODE, "Unknown error decoding rows");
+    return d->rows_done;
+  }
+  d->in.env = nullptr;
+
+  /* Done: the pipeline and the stream are dead weight until close. */
+  if (d->rows_done >= d->height) {
+    g_object_unref(d->region);
+    d->region = nullptr;
+    g_object_unref(d->image);
+    d->image = nullptr;
+    g_object_unref(d->source);
+    d->source = nullptr;
+    row_stream_release(env, &d->in);
+  }
+  return d->rows_done;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_ca_mpreg_imagedecoder_RowDecoder_nativeFree(JNIEnv* env, jobject obj)
+{
+  row_decoder_free(env, reinterpret_cast<RowDecoder*>(take_ptr(env, obj)));
 }
