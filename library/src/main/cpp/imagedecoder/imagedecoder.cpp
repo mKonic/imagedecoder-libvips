@@ -8,6 +8,8 @@
 #include <jni.h>
 #include <vips/vips8>
 
+#include <webp/decode.h>
+
 #include "exif.h"
 #include "hdr.h"
 
@@ -1386,11 +1388,27 @@ struct RowStream
   uint8_t* data;
   size_t len;
   size_t cap;
+
+  /* While set, reads hand back the tee from [replay_pos] before touching the stream: the bytes
+   * sniffed to pick a decoder are still the start of the file to libvips. */
+  bool replaying;
+  size_t replay_pos;
 };
 
 struct RowDecoder
 {
   RowStream in;
+
+  /* A WebP decodes through libwebp's incremental decoder, which libvips does not use: its loader
+   * takes the whole file before decoding a row. */
+  WebPIDecoder* webp;
+  bool webp_done;
+
+  /* The WebP's ICC profile, applied to each strip as it lands exactly as the whole decode applies
+   * it to the whole image: it is a per-pixel transform. */
+  void* icc;
+  size_t icc_size;
+
   VipsSourceCustom* source;
   VipsImage* image;
   VipsRegion* region;
@@ -1420,6 +1438,9 @@ row_decoder_free(JNIEnv* env, RowDecoder* d)
 {
   if (!d)
     return;
+  if (d->webp)
+    WebPIDelete(d->webp);
+  g_free(d->icc);
   if (d->region)
     g_object_unref(d->region);
   if (d->image)
@@ -1455,6 +1476,13 @@ static gint64
 row_stream_read(VipsSourceCustom*, void* buf, gint64 length, void* user)
 {
   RowStream* s = (RowStream*)user;
+  if (s->replaying && s->replay_pos < s->len && length > 0) {
+    size_t n = VIPS_MIN((size_t)length, s->len - s->replay_pos);
+    memcpy(buf, s->data + s->replay_pos, n);
+    s->replay_pos += n;
+    return (gint64)n;
+  }
+
   JNIEnv* env = s->env;
   if (!env || s->failed || length <= 0)
     return -1;
@@ -1485,6 +1513,9 @@ row_stream_read(VipsSourceCustom*, void* buf, gint64 length, void* user)
     s->failed = true;
     return -1;
   }
+  /* Fresh bytes have been handed out already; replaying must not serve them again. */
+  if (s->replaying)
+    s->replay_pos = s->len;
   return n;
 }
 
@@ -1492,6 +1523,8 @@ row_stream_read(VipsSourceCustom*, void* buf, gint64 length, void* user)
 static void
 row_stream_drain(RowStream* s)
 {
+  /* Whatever a loader already took is in the tee; only the stream's remainder is missing. */
+  s->replaying = false;
   std::vector<uint8_t> buf(ROW_CHUNK);
   while (true) {
     gint64 n = row_stream_read(nullptr, buf.data(), ROW_CHUNK, s);
@@ -1502,6 +1535,26 @@ row_stream_drain(RowStream* s)
            s->total > (guint64)MAX_INPUT_BYTES ? "Out of memory: image exceeds the maximum input size"
                                               : "InputStream.read failed");
   }
+}
+
+/* Appends one more read to the tee. False at the end of the stream. */
+static bool
+row_stream_more(RowStream* s)
+{
+  const bool replaying = s->replaying;
+  s->replaying = false;
+  uint8_t buf[16 * 1024];
+  gint64 n = row_stream_read(nullptr, buf, sizeof(buf), s);
+  s->replaying = replaying;
+  if (n < 0)
+    fail(EXC_DECODE, "InputStream.read failed");
+  return n > 0;
+}
+
+static bool
+is_webp(const RowStream& in)
+{
+  return in.len >= 12 && memcmp(in.data, "RIFF", 4) == 0 && memcmp(in.data + 8, "WEBP", 4) == 0;
 }
 
 /* Whether [image] comes out of the plain 8-bit path unchanged in a top-to-bottom pass: no second
@@ -1533,6 +1586,161 @@ rows_possible(vips::VImage& image, const RowStream& in)
   return true;
 }
 
+/* Reads the rest of the stream after the tee and hands everything to a whole-file ImageDecoder,
+ * freeing [d]. Leaves an exception pending on failure. */
+static jobject
+whole_from_tee(JNIEnv* env, RowDecoder* d)
+{
+  row_stream_drain(&d->in);
+
+  Decoder* whole = decoder_new();
+  if (!whole)
+    fail(EXC_OOM, "Out of memory creating the decoder");
+  whole->buffer = d->in.data;
+  whole->buffer_size = d->in.len;
+  d->in.data = nullptr;
+  row_decoder_free(env, d);
+  return decoder_object(env, whole);
+}
+
+/* The RGBA8 output for [d]'s rows. */
+static void
+row_alloc_output(JNIEnv* env, RowDecoder* d)
+{
+  check_dimensions(d->width, d->height);
+
+  const size_t size = checked_buffer_size((guint64)d->width * (guint64)d->height, 4);
+  void* data = nullptr;
+  jobject buffer = allocate_direct(env, size, &data);
+  LocalRef buffer_ref(env, buffer);
+  d->out = (uint8_t*)data;
+  d->buffer = env->NewGlobalRef(buffer);
+  if (!d->buffer)
+    fail(EXC_OOM, "Out of memory holding the pixel buffer");
+}
+
+/* Wraps [d] in a RowDecoder, which then owns it. The last step of an open: nothing may fail
+ * after it, or [d] would be freed under the object's feet. */
+static jobject
+row_decoder_object(JNIEnv* env, RowDecoder* d, const char* loader)
+{
+  jstring jloader = env->NewStringUTF(loader);
+  if (!jloader || env->ExceptionCheck()) {
+    if (env->ExceptionCheck())
+      env->ExceptionClear();
+    fail(EXC_OOM, "Out of memory creating the loader name");
+  }
+  LocalRef loader_ref(env, jloader);
+
+  jclass cls = find_class_checked(env, "ca/mpreg/imagedecoder/RowDecoder");
+  LocalRef cls_ref(env, cls);
+  jmethodID ctor =
+    get_method_checked(env, cls, "<init>", "(JIILjava/nio/ByteBuffer;Ljava/lang/String;)V");
+
+  jobject result =
+    env->NewObject(cls, ctor, reinterpret_cast<jlong>(d), d->width, d->height, d->buffer, jloader);
+  if (!result || env->ExceptionCheck()) {
+    if (env->ExceptionCheck())
+      env->ExceptionClear();
+    if (result)
+      env->DeleteLocalRef(result);
+    fail(EXC_OOM, "Out of memory creating the decoder object");
+  }
+  return result;
+}
+
+/* VP8X feature flags. EXIF may carry an orientation libvips would apply, which rows from the
+ * top cannot; an ICC profile is applied per strip (see webp_colour_rows). */
+static const uint8_t WEBP_FLAG_ICC = 0x20;
+static const uint8_t WEBP_FLAG_EXIF = 0x08;
+
+/* Copies the ICCP chunk out of the header, reading on until all of it is in. The chunks between
+ * VP8X and the bitstream are small, and ICCP comes first of them. */
+static void
+webp_read_icc(RowDecoder* d)
+{
+  size_t at = 12;
+  while (true) {
+    while (d->in.len < at + 8) {
+      if (!row_stream_more(&d->in))
+        fail(EXC_DECODE, "Truncated WebP header");
+    }
+    const uint8_t* chunk = d->in.data + at;
+    const uint32_t size = chunk[4] | (chunk[5] << 8) | (chunk[6] << 16) | ((uint32_t)chunk[7] << 24);
+    if (memcmp(chunk, "VP8 ", 4) == 0 || memcmp(chunk, "VP8L", 4) == 0 ||
+        memcmp(chunk, "ANMF", 4) == 0 || memcmp(chunk, "ALPH", 4) == 0)
+      return;
+    if (size > (uint32_t)MAX_INPUT_BYTES)
+      fail(EXC_DECODE, "Invalid WebP chunk size");
+    if (memcmp(chunk, "ICCP", 4) == 0) {
+      while (d->in.len < at + 8 + size) {
+        if (!row_stream_more(&d->in))
+          fail(EXC_DECODE, "Truncated WebP ICC profile");
+      }
+      d->icc = g_try_malloc(size);
+      if (!d->icc)
+        fail(EXC_OOM, "Out of memory holding the ICC profile");
+      memcpy(d->icc, d->in.data + at + 8, size);
+      d->icc_size = size;
+      return;
+    }
+    at += 8 + size + (size & 1);
+  }
+}
+
+/* Runs rows [y0, y1) of the output through the same ICC transform the whole decode uses. */
+static void
+webp_colour_rows(RowDecoder* d, int y0, int y1)
+{
+  if (!d->icc || y1 <= y0)
+    return;
+
+  const size_t row_bytes = (size_t)d->width * 4;
+  uint8_t* rows = d->out + (size_t)y0 * row_bytes;
+  const size_t size = (size_t)(y1 - y0) * row_bytes;
+
+  vips::VImage strip =
+    vips::VImage::new_from_memory(rows, size, d->width, y1 - y0, 4, VIPS_FORMAT_UCHAR)
+      .copy(vips::VImage::option()->set("interpretation", VIPS_INTERPRETATION_sRGB));
+  strip.set(VIPS_META_ICC_NAME, (VipsCallbackFn) nullptr, d->icc, d->icc_size);
+
+  vips::VImage out = to_srgb_primaries(strip);
+  if (out.bands() != 4 || out.format() != VIPS_FORMAT_UCHAR)
+    return;
+
+  /* Not in place: the transform reads the strip while writing its result. */
+  std::vector<uint8_t> result(size);
+  out.write(vips::VImage::new_from_memory(result.data(), size, d->width, y1 - y0, 4,
+                                          VIPS_FORMAT_UCHAR));
+  memcpy(rows, result.data(), size);
+}
+
+/* A WebP from the header on, or null when it has to decode whole. */
+static bool
+open_webp_rows(RowDecoder* d)
+{
+  WebPBitstreamFeatures features;
+  VP8StatusCode status;
+  while ((status = WebPGetFeatures(d->in.data, d->in.len, &features)) ==
+         VP8_STATUS_NOT_ENOUGH_DATA) {
+    if (!row_stream_more(&d->in))
+      fail(EXC_DECODE, "Truncated WebP header");
+  }
+  if (status != VP8_STATUS_OK)
+    fail(EXC_DECODE, "Invalid WebP header");
+
+  const bool vp8x = d->in.len >= 21 && memcmp(d->in.data + 12, "VP8X", 4) == 0;
+  const uint8_t flags = vp8x ? d->in.data[20] : 0;
+  if (features.has_animation || (flags & WEBP_FLAG_EXIF))
+    return false;
+  if (flags & WEBP_FLAG_ICC)
+    webp_read_icc(d);
+
+  d->width = features.width;
+  d->height = features.height;
+  return true;
+}
+
 extern "C" JNIEXPORT jobject JNICALL
 Java_ca_mpreg_imagedecoder_ImageDecoder_nativeOpenRows(JNIEnv* env, jclass, jobject jstream)
 {
@@ -1548,9 +1756,6 @@ Java_ca_mpreg_imagedecoder_ImageDecoder_nativeOpenRows(JNIEnv* env, jclass, jobj
   }
   d->in.env = env;
   d->in.tee = true;
-
-  Decoder* whole = nullptr;
-  jobject result = nullptr;
 
   try {
     jclass stream_cls = env->GetObjectClass(jstream);
@@ -1568,7 +1773,35 @@ Java_ca_mpreg_imagedecoder_ImageDecoder_nativeOpenRows(JNIEnv* env, jclass, jobj
     if (!d->in.stream || !d->in.chunk)
       fail(EXC_OOM, "Out of memory holding the stream");
 
+    /* The signature picks the decoder; the bytes stay in the tee for whichever reads the file. */
+    while (d->in.len < 16 && row_stream_more(&d->in)) {
+    }
+
+    if (is_webp(d->in)) {
+      if (!open_webp_rows(d))
+        return whole_from_tee(env, d);
+
+      row_alloc_output(env, d);
+      d->webp = WebPINewRGB(MODE_RGBA, d->out, (size_t)d->width * d->height * 4, d->width * 4);
+      if (!d->webp)
+        fail(EXC_OOM, "Out of memory creating the WebP decoder");
+      /* Copied in: the tee is done with from here. */
+      VP8StatusCode status = WebPIAppend(d->webp, d->in.data, d->in.len);
+      if (status != VP8_STATUS_OK && status != VP8_STATUS_SUSPENDED)
+        fail(EXC_DECODE, "Invalid WebP data");
+      d->webp_done = status == VP8_STATUS_OK;
+      d->in.tee = false;
+      g_free(d->in.data);
+      d->in.data = nullptr;
+      d->in.len = d->in.cap = 0;
+
+      jobject result = row_decoder_object(env, d, "webpload_source");
+      d->in.env = nullptr;
+      return result;
+    }
+
     /* No seek handler: libvips treats the source as a pipe and buffers only what sniffing needs. */
+    d->in.replaying = true;
     d->source = vips_source_custom_new();
     if (!d->source)
       throw vips::VError();
@@ -1583,29 +1816,12 @@ Java_ca_mpreg_imagedecoder_ImageDecoder_nativeOpenRows(JNIEnv* env, jclass, jobj
     check_dimensions(image.width(), image.height());
 
     if (!rows_possible(image, d->in)) {
-      /* The header read already took the first bytes; the tee holds them for the whole decode. */
       image = vips::VImage();
-      row_stream_drain(&d->in);
-
-      whole = decoder_new();
-      if (!whole)
-        fail(EXC_OOM, "Out of memory creating the decoder");
-      whole->buffer = d->in.data;
-      whole->buffer_size = d->in.len;
-      d->in.data = nullptr;
-      row_decoder_free(env, d);
-      d = nullptr;
-
-      Decoder* owned = whole;
-      whole = nullptr;
-      return decoder_object(env, owned);
+      return whole_from_tee(env, d);
     }
 
     /* Rows from here on are decoded straight through; nothing needs the bytes again. */
     d->in.tee = false;
-    g_free(d->in.data);
-    d->in.data = nullptr;
-    d->in.len = d->in.cap = 0;
 
     vips::VImage frame = to_srgb_primaries(image);
     if (frame.interpretation() != VIPS_INTERPRETATION_sRGB)
@@ -1619,60 +1835,23 @@ Java_ca_mpreg_imagedecoder_ImageDecoder_nativeOpenRows(JNIEnv* env, jclass, jobj
 
     d->width = frame.width();
     d->height = frame.height();
-    check_dimensions(d->width, d->height);
-
     d->image = frame.get_image();
     g_object_ref(d->image);
     d->region = vips_region_new(d->image);
     if (!d->region)
       throw vips::VError();
 
-    const size_t size = checked_buffer_size((guint64)d->width * (guint64)d->height, 4);
-    void* data = nullptr;
-    jobject buffer = allocate_direct(env, size, &data);
-    d->out = (uint8_t*)data;
-    d->buffer = env->NewGlobalRef(buffer);
-    if (!d->buffer) {
-      env->DeleteLocalRef(buffer);
-      fail(EXC_OOM, "Out of memory holding the pixel buffer");
-    }
-
+    row_alloc_output(env, d);
     const char* loader = image.get_string("vips-loader");
-    jstring jloader = env->NewStringUTF(loader ? loader : "");
-    if (!jloader || env->ExceptionCheck()) {
-      if (env->ExceptionCheck())
-        env->ExceptionClear();
-      env->DeleteLocalRef(buffer);
-      fail(EXC_OOM, "Out of memory creating the loader name");
-    }
-    LocalRef loader_ref(env, jloader);
-
-    jclass cls = find_class_checked(env, "ca/mpreg/imagedecoder/RowDecoder");
-    LocalRef cls_ref(env, cls);
-    jmethodID ctor =
-      get_method_checked(env, cls, "<init>", "(JIILjava/nio/ByteBuffer;Ljava/lang/String;)V");
-
+    jobject result = row_decoder_object(env, d, loader ? loader : "");
     d->in.env = nullptr;
-    result = env->NewObject(cls, ctor, reinterpret_cast<jlong>(d), d->width, d->height, buffer,
-                            jloader);
-    env->DeleteLocalRef(buffer);
-    if (!result || env->ExceptionCheck()) {
-      if (env->ExceptionCheck())
-        env->ExceptionClear();
-      if (result)
-        env->DeleteLocalRef(result);
-      result = nullptr;
-      fail(EXC_OOM, "Out of memory creating the decoder object");
-    }
     return result;
   } catch (const DecodeError& e) {
-    decoder_free(whole);
     row_decoder_free(env, d);
     throw_decode_error(env, e.cls, e.msg.c_str());
     return nullptr;
   } catch (const vips::VError& e) {
     const bool stream_failed = d && d->in.failed;
-    decoder_free(whole);
     row_decoder_free(env, d);
     if (stream_failed) {
       vips_error_clear();
@@ -1682,13 +1861,11 @@ Java_ca_mpreg_imagedecoder_ImageDecoder_nativeOpenRows(JNIEnv* env, jclass, jobj
     }
     return nullptr;
   } catch (const std::bad_alloc&) {
-    decoder_free(whole);
     row_decoder_free(env, d);
     vips_error_clear();
     throw_decode_error(env, EXC_OOM, "Out of memory reading the image header");
     return nullptr;
   } catch (...) {
-    decoder_free(whole);
     row_decoder_free(env, d);
     vips_error_clear();
     throw_decode_error(env, EXC_DECODE, "Unknown error reading the image header");
@@ -1711,6 +1888,34 @@ Java_ca_mpreg_imagedecoder_RowDecoder_nativeDecodeRows(JNIEnv* env, jobject obj,
 
   d->in.env = env;
   try {
+    if (d->webp) {
+      const int target = VIPS_MIN(d->height, d->rows_done + max_rows);
+      int last_y = 0;
+      std::vector<uint8_t> buf;
+      while (true) {
+        if (!WebPIDecGetRGB(d->webp, &last_y, nullptr, nullptr, nullptr))
+          last_y = 0;
+        if (last_y >= target || d->webp_done)
+          break;
+        if (buf.empty())
+          buf.resize(ROW_CHUNK);
+        gint64 n = row_stream_read(nullptr, buf.data(), ROW_CHUNK, &d->in);
+        if (n < 0)
+          fail(EXC_DECODE, "InputStream.read failed");
+        if (n == 0)
+          fail(EXC_DECODE, "Truncated WebP");
+        VP8StatusCode status = WebPIAppend(d->webp, buf.data(), (size_t)n);
+        if (status == VP8_STATUS_OK)
+          d->webp_done = true;
+        else if (status != VP8_STATUS_SUSPENDED)
+          fail(EXC_DECODE, "Invalid WebP data");
+      }
+      if (d->webp_done && WebPIDecGetRGB(d->webp, &last_y, nullptr, nullptr, nullptr))
+        last_y = d->height;
+      const int done = VIPS_MIN(VIPS_MAX(last_y, d->rows_done), d->height);
+      webp_colour_rows(d, d->rows_done, done);
+      d->rows_done = done;
+    } else {
     const int y = d->rows_done;
     const int n = VIPS_MIN(max_rows, d->height - y);
     VipsRect rect = { 0, y, d->width, n };
@@ -1721,6 +1926,11 @@ Java_ca_mpreg_imagedecoder_RowDecoder_nativeDecodeRows(JNIEnv* env, jobject obj,
     for (int i = 0; i < n; i++)
       memcpy(d->out + (size_t)(y + i) * row_bytes, VIPS_REGION_ADDR(d->region, 0, y + i), row_bytes);
     d->rows_done = y + n;
+    }
+  } catch (const DecodeError& e) {
+    d->in.env = nullptr;
+    throw_decode_error(env, e.cls, e.msg.c_str());
+    return d->rows_done;
   } catch (const vips::VError& e) {
     d->in.env = nullptr;
     if (d->in.failed) {
@@ -1740,11 +1950,17 @@ Java_ca_mpreg_imagedecoder_RowDecoder_nativeDecodeRows(JNIEnv* env, jobject obj,
 
   /* Done: the pipeline and the stream are dead weight until close. */
   if (d->rows_done >= d->height) {
-    g_object_unref(d->region);
+    if (d->webp)
+      WebPIDelete(d->webp);
+    d->webp = nullptr;
+    if (d->region)
+      g_object_unref(d->region);
     d->region = nullptr;
-    g_object_unref(d->image);
+    if (d->image)
+      g_object_unref(d->image);
     d->image = nullptr;
-    g_object_unref(d->source);
+    if (d->source)
+      g_object_unref(d->source);
     d->source = nullptr;
     row_stream_release(env, &d->in);
   }
