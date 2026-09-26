@@ -50,15 +50,17 @@ dependencies {}
  * native libraries are all linked into the one .so.
  */
 val writeIvyDescriptor by tasks.registering {
-    val descriptor = layout.buildDirectory.file("outputs/ivy/ivy-$tag.xml")
-    inputs.property("version", tag)
+    // A local, not the script's own property, which the configuration cache cannot serialise.
+    val version = tag
+    val descriptor = layout.buildDirectory.file("outputs/ivy/ivy-$version.xml")
+    inputs.property("version", version)
     outputs.file(descriptor)
     doLast {
         descriptor.get().asFile.apply { parentFile.mkdirs() }.writeText(
             """
             |<?xml version="1.0" encoding="UTF-8"?>
             |<ivy-module version="2.0">
-            |    <info organisation="ca.mpreg" module="imagedecoder" revision="$tag"/>
+            |    <info organisation="ca.mpreg" module="imagedecoder" revision="$version"/>
             |    <configurations>
             |        <conf name="default"/>
             |    </configurations>
