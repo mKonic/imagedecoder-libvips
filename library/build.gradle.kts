@@ -15,6 +15,7 @@ android {
 
     defaultConfig {
         minSdk = 24
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         externalNativeBuild {
             cmake {
@@ -31,6 +32,9 @@ android {
         }
     }
 
+    // The native build is libvips and every codec from source; a debug variant would be a second one.
+    testBuildType = "release"
+
     buildTypes {
         release {
             isMinifyEnabled = false
@@ -43,7 +47,11 @@ android {
     }
 }
 
-dependencies {}
+dependencies {
+    androidTestImplementation(libs.junit)
+    androidTestImplementation(libs.androidx.test.runner)
+    androidTestImplementation(libs.androidx.test.junit)
+}
 
 /**
  * The ivy descriptor hosts resolve this AAR through from a GitHub release. Nothing to list: the
