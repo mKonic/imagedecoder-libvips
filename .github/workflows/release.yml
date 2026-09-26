@@ -1,0 +1,100 @@
+name: Release
+
+# Releasing is tagging: a semver tag (v1.2.3, v1.2.3-rc.1, ...) builds the AAR and publishes it, with
+# the ivy descriptor hosts resolve it through, as that tag's release. The filter only narrows to v*;
+# the check below holds the tag to the full semver grammar.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build and publish
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          # scripts/version.sh counts commits and describes against tags - a shallow clone gets both wrong.
+          fetch-depth: 0
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: 17
+          distribution: temurin
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt update
+          sudo apt install \
+            build-essential \
+            autoconf \
+            automake \
+            libtool \
+            gettext \
+            autopoint \
+            ninja-build \
+            nasm \
+            libltdl-dev \
+            libglib2.0-dev \
+            texinfo \
+            gperf
+          python -m pip install --upgrade pip
+          python -m pip install meson
+
+      - name: Check the tag is the version
+        run: |
+          semver='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+          [[ "$TAG" =~ $semver ]] || { echo "$TAG is not a semver tag"; exit 1; }
+          name=$(bash scripts/version.sh name)
+          [ "$name" = "$TAG" ] || { echo "scripts/version.sh reports $name, not $TAG"; exit 1; }
+          echo "Releasing $TAG, build $(bash scripts/version.sh code)"
+
+      - name: Build
+        run: ./gradlew :library:assembleRelease :library:writeIvyDescriptor
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=${TAG#v}
+          mkdir -p dist
+          cp library/build/outputs/aar/library-release.aar "dist/imagedecoder-$version.aar"
+          cp "library/build/outputs/ivy/ivy-$version.xml" dist/
+
+          # Everything since the previous release, or since upstream's last before the first one.
+          previous=$(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' "$TAG^" 2> /dev/null \
+            || git describe --tags --abbrev=0 --match '[0-9]*' "$TAG^" 2> /dev/null || true)
+          git log --format='- %s' "${previous:+$previous..}$TAG" > notes.md
+
+          # A semver pre-release (a -suffix ahead of any +build) is published as one.
+          prerelease=()
+          case "${TAG%%+*}" in *-*) prerelease=(--prerelease) ;; esac
+
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+            gh release edit "$TAG" --notes-file notes.md
+          else
+            gh release create "$TAG" "${prerelease[@]}" --title "$TAG" --notes-file notes.md dist/*
+          fi

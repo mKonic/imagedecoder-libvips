@@ -3,14 +3,11 @@ plugins {
     id("com.vanniktech.maven.publish") version "0.36.0"
 }
 
-val tag = if (System.getenv("GITHUB_REF_TYPE") == "tag") {
-    System.getenv("GITHUB_REF_NAME")
-} else {
-    val baseVersion = providers.exec {
-        commandLine("git", "rev-parse", "--short", "HEAD")
-    }.standardOutput.asText.map { it.trim() }.getOrElse("unknown")
-    "$baseVersion-SNAPSHOT"
-}
+// The fork's version is its last semver tag: scripts/version.sh is the one source. Releasing is
+// tagging, and the release workflow publishes the AAR with an ivy descriptor beside it.
+val tag: String = providers.exec {
+    commandLine("bash", rootProject.file("scripts/version.sh").path, "name")
+}.standardOutput.asText.map { it.trim().removePrefix("v") }.getOrElse("unknown")
 
 android {
     namespace = "ca.mpreg.imagedecoder"
@@ -47,6 +44,32 @@ android {
 }
 
 dependencies {}
+
+/**
+ * The ivy descriptor hosts resolve this AAR through from a GitHub release. Nothing to list: the
+ * native libraries are all linked into the one .so.
+ */
+val writeIvyDescriptor by tasks.registering {
+    val descriptor = layout.buildDirectory.file("outputs/ivy/ivy-$tag.xml")
+    inputs.property("version", tag)
+    outputs.file(descriptor)
+    doLast {
+        descriptor.get().asFile.apply { parentFile.mkdirs() }.writeText(
+            """
+            |<?xml version="1.0" encoding="UTF-8"?>
+            |<ivy-module version="2.0">
+            |    <info organisation="ca.mpreg" module="imagedecoder" revision="$tag"/>
+            |    <configurations>
+            |        <conf name="default"/>
+            |    </configurations>
+            |    <publications>
+            |        <artifact name="imagedecoder" type="aar" ext="aar" conf="default"/>
+            |    </publications>
+            |</ivy-module>
+            |""".trimMargin()
+        )
+    }
+}
 
 afterEvaluate {
     mavenPublishing {
