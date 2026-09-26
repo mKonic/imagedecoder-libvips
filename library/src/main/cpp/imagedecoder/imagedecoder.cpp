@@ -1972,3 +1972,194 @@ Java_ca_mpreg_imagedecoder_RowDecoder_nativeFree(JNIEnv* env, jobject obj)
 {
   row_decoder_free(env, reinterpret_cast<RowDecoder*>(take_ptr(env, obj)));
 }
+
+/* ---------------------------------------------------------- frame playback
+ *
+ * An animation's frames in order, each decoded once: libvips loads every page as one tall image
+ * (n = -1) with sequential access, and frame i is its rows [i * page height, (i + 1) * page
+ * height). decode(page) cannot do that - each call composes the animation from its first frame
+ * again, so frame i costs i frames. Wrapping past the last frame reopens the file. Reads the
+ * ImageDecoder's buffer, so it must be closed first. */
+
+struct Frames
+{
+  const uint8_t* file;
+  size_t file_size;
+  VipsImage* image;
+  VipsRegion* region;
+  int width;
+  int page_height;
+  int pages;
+  int next;
+  uint8_t* out;
+  jobject buffer;
+};
+
+static void
+frames_release_pipeline(Frames* f)
+{
+  if (f->region)
+    g_object_unref(f->region);
+  if (f->image)
+    g_object_unref(f->image);
+  f->region = nullptr;
+  f->image = nullptr;
+}
+
+static void
+frames_free(JNIEnv* env, Frames* f)
+{
+  if (!f)
+    return;
+  frames_release_pipeline(f);
+  if (f->buffer)
+    env->DeleteGlobalRef(f->buffer);
+  g_free(f);
+}
+
+/* The same 8-bit pipeline nativeDecode runs, over every frame at once. */
+static void
+frames_open_pipeline(Frames* f)
+{
+  frames_release_pipeline(f);
+
+  vips::VImage all = vips::VImage::new_from_buffer(
+    f->file, f->file_size, "",
+    vips::VImage::option()->set("access", VIPS_ACCESS_SEQUENTIAL)->set("n", -1));
+
+  vips::VImage frame = to_srgb_primaries(all);
+  if (frame.interpretation() != VIPS_INTERPRETATION_sRGB)
+    frame = frame.colourspace(VIPS_INTERPRETATION_sRGB);
+  if (frame.bands() < 4)
+    frame = frame.bandjoin(255);
+  if (frame.bands() > 4)
+    frame = frame.extract_band(0, vips::VImage::option()->set("n", 4));
+  if (frame.format() != VIPS_FORMAT_UCHAR)
+    frame = frame.cast(VIPS_FORMAT_UCHAR);
+
+  if (frame.width() != f->width || frame.height() != f->page_height * f->pages)
+    fail(EXC_DECODE, "Animation frames changed size");
+
+  f->image = frame.get_image();
+  g_object_ref(f->image);
+  f->region = vips_region_new(f->image);
+  if (!f->region)
+    throw vips::VError();
+  f->next = 0;
+}
+
+extern "C" JNIEXPORT jobject JNICALL
+Java_ca_mpreg_imagedecoder_ImageDecoder_nativeFrames(JNIEnv* env, jobject obj)
+{
+  Frames* f = nullptr;
+  try {
+    Decoder* decoder = decoder_for(env, obj);
+    /* Only what the plain 8-bit path hands back unchanged: HDR frames and a rotation go
+     * through steps a stacked image cannot take frame by frame. */
+    if (decoder->pages < 2 || decoder->hdr_kind != HDR_NONE)
+      return nullptr;
+
+    vips::VImage header = vips::VImage::new_from_buffer(
+      decoder->buffer, decoder->buffer_size, "",
+      vips::VImage::option()->set("access", VIPS_ACCESS_SEQUENTIAL)->set("n", -1));
+    if (header.get_typeof(VIPS_META_ORIENTATION) != 0 && header.get_int(VIPS_META_ORIENTATION) > 1)
+      return nullptr;
+    const int page_height = vips_image_get_page_height(header.get_image());
+    if (page_height <= 0 || header.height() % page_height != 0)
+      return nullptr;
+    const int pages = header.height() / page_height;
+    if (pages < 2)
+      return nullptr;
+    check_dimensions(header.width(), page_height);
+
+    f = g_try_new0(Frames, 1);
+    if (!f)
+      fail(EXC_OOM, "Out of memory creating the frame decoder");
+    f->file = decoder->buffer;
+    f->file_size = decoder->buffer_size;
+    f->width = header.width();
+    f->page_height = page_height;
+    f->pages = pages;
+    header = vips::VImage();
+
+    frames_open_pipeline(f);
+
+    const size_t size = checked_buffer_size((guint64)f->width * (guint64)f->page_height, 4);
+    void* data = nullptr;
+    jobject buffer = allocate_direct(env, size, &data);
+    LocalRef buffer_ref(env, buffer);
+    f->out = (uint8_t*)data;
+    f->buffer = env->NewGlobalRef(buffer);
+    if (!f->buffer)
+      fail(EXC_OOM, "Out of memory holding the frame buffer");
+
+    jclass cls = find_class_checked(env, "ca/mpreg/imagedecoder/FrameDecoder");
+    LocalRef cls_ref(env, cls);
+    jmethodID ctor = get_method_checked(env, cls, "<init>", "(JIIILjava/nio/ByteBuffer;)V");
+    jobject result = env->NewObject(cls, ctor, reinterpret_cast<jlong>(f), f->width, f->page_height,
+                                    f->pages, f->buffer);
+    if (!result || env->ExceptionCheck()) {
+      if (env->ExceptionCheck())
+        env->ExceptionClear();
+      if (result)
+        env->DeleteLocalRef(result);
+      fail(EXC_OOM, "Out of memory creating the frame decoder object");
+    }
+    return result;
+  } catch (const DecodeError& e) {
+    frames_free(env, f);
+    throw_decode_error(env, e.cls, e.msg.c_str());
+  } catch (const vips::VError& e) {
+    frames_free(env, f);
+    throw_vips_error(env, e);
+  } catch (...) {
+    frames_free(env, f);
+    vips_error_clear();
+    throw_decode_error(env, EXC_DECODE, "Unknown error opening the frames");
+  }
+  return nullptr;
+}
+
+/* Decodes the next frame into the buffer and returns its index. */
+extern "C" JNIEXPORT jint JNICALL
+Java_ca_mpreg_imagedecoder_FrameDecoder_nativeNext(JNIEnv* env, jobject obj)
+{
+  Frames* f = reinterpret_cast<Frames*>(get_ptr(env, obj));
+  if (!f) {
+    throw_decode_error(env, EXC_DECODE, "FrameDecoder has been closed");
+    return -1;
+  }
+  try {
+    if (f->next >= f->pages || !f->region)
+      frames_open_pipeline(f);
+
+    const int index = f->next;
+    VipsRect rect = { 0, index * f->page_height, f->width, f->page_height };
+    if (vips_region_prepare(f->region, &rect))
+      throw vips::VError();
+
+    const size_t row_bytes = (size_t)f->width * 4;
+    for (int y = 0; y < f->page_height; y++)
+      memcpy(f->out + (size_t)y * row_bytes,
+             VIPS_REGION_ADDR(f->region, 0, index * f->page_height + y), row_bytes);
+    f->next = index + 1;
+    return index;
+  } catch (const DecodeError& e) {
+    frames_release_pipeline(f);
+    throw_decode_error(env, e.cls, e.msg.c_str());
+  } catch (const vips::VError& e) {
+    frames_release_pipeline(f);
+    throw_vips_error(env, e);
+  } catch (...) {
+    frames_release_pipeline(f);
+    vips_error_clear();
+    throw_decode_error(env, EXC_DECODE, "Unknown error decoding a frame");
+  }
+  return -1;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_ca_mpreg_imagedecoder_FrameDecoder_nativeFree(JNIEnv* env, jobject obj)
+{
+  frames_free(env, reinterpret_cast<Frames*>(take_ptr(env, obj)));
+}

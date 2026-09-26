@@ -219,6 +219,25 @@ class ImageDecoder private constructor(
 
     private external fun nativeDecode(page: Int, crop: Boolean, getTrim: Boolean): DecodeResult
 
+    /** Closed with this decoder: they read its data. */
+    private val frameDecoders = mutableListOf<FrameDecoder>()
+
+    /**
+     * The frames of an animation in order, each decoded once, for playing it without holding
+     * every frame. Null for a still image, and for an animation whose frames need more than the
+     * plain 8-bit path (HDR, a rotation), which [decode] still handles frame by frame.
+     *
+     * Valid while this decoder is open; closing it closes the frames too.
+     */
+    @Synchronized
+    @Throws(DecodeException::class)
+    fun frames(): FrameDecoder? {
+        checkOpen()
+        return nativeFrames()?.also { frameDecoders.add(it) }
+    }
+
+    private external fun nativeFrames(): FrameDecoder?
+
     /** Exif and tiff tag names of the main image, in file order; no value is parsed. */
     @Synchronized
     @Throws(DecodeException::class)
@@ -288,7 +307,11 @@ class ImageDecoder private constructor(
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
         // The monitor, not just the flag: a decode in flight is still reading the buffer.
-        synchronized(this) { nativeFree() }
+        synchronized(this) {
+            frameDecoders.forEach { it.close() }
+            frameDecoders.clear()
+            nativeFree()
+        }
     }
 
     private fun checkOpen() {
