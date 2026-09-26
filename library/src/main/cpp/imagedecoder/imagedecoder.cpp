@@ -9,6 +9,7 @@
 #include <vips/vips8>
 
 #include <webp/decode.h>
+#include <webp/demux.h>
 
 #include "exif.h"
 #include "hdr.h"
@@ -1688,21 +1689,19 @@ webp_read_icc(RowDecoder* d)
   }
 }
 
-/* Runs rows [y0, y1) of the output through the same ICC transform the whole decode uses. */
+/* Runs [height] RGBA8 rows at [rows] through the ICC transform the whole decode applies to an
+ * image carrying [icc]: a per-pixel transform, so a strip at a time gives the same pixels. */
 static void
-webp_colour_rows(RowDecoder* d, int y0, int y1)
+icc_to_srgb_rows(uint8_t* rows, int width, int height, void* icc, size_t icc_size)
 {
-  if (!d->icc || y1 <= y0)
+  if (!icc || height <= 0)
     return;
 
-  const size_t row_bytes = (size_t)d->width * 4;
-  uint8_t* rows = d->out + (size_t)y0 * row_bytes;
-  const size_t size = (size_t)(y1 - y0) * row_bytes;
-
+  const size_t size = (size_t)height * width * 4;
   vips::VImage strip =
-    vips::VImage::new_from_memory(rows, size, d->width, y1 - y0, 4, VIPS_FORMAT_UCHAR)
+    vips::VImage::new_from_memory(rows, size, width, height, 4, VIPS_FORMAT_UCHAR)
       .copy(vips::VImage::option()->set("interpretation", VIPS_INTERPRETATION_sRGB));
-  strip.set(VIPS_META_ICC_NAME, (VipsCallbackFn) nullptr, d->icc, d->icc_size);
+  strip.set(VIPS_META_ICC_NAME, (VipsCallbackFn) nullptr, icc, icc_size);
 
   vips::VImage out = to_srgb_primaries(strip);
   if (out.bands() != 4 || out.format() != VIPS_FORMAT_UCHAR)
@@ -1710,9 +1709,17 @@ webp_colour_rows(RowDecoder* d, int y0, int y1)
 
   /* Not in place: the transform reads the strip while writing its result. */
   std::vector<uint8_t> result(size);
-  out.write(vips::VImage::new_from_memory(result.data(), size, d->width, y1 - y0, 4,
+  out.write(vips::VImage::new_from_memory(result.data(), size, width, height, 4,
                                           VIPS_FORMAT_UCHAR));
   memcpy(rows, result.data(), size);
+}
+
+/* Runs rows [y0, y1) of the output through the same ICC transform the whole decode uses. */
+static void
+webp_colour_rows(RowDecoder* d, int y0, int y1)
+{
+  if (y1 > y0)
+    icc_to_srgb_rows(d->out + (size_t)y0 * d->width * 4, d->width, y1 - y0, d->icc, d->icc_size);
 }
 
 /* A WebP from the header on, or null when it has to decode whole. */
@@ -1985,6 +1992,13 @@ struct Frames
 {
   const uint8_t* file;
   size_t file_size;
+
+  /* An animated WebP plays through libwebp's own compositor: libvips' loader does not stream,
+   * so its first frame request decodes every frame into one temporary image. */
+  WebPAnimDecoder* webp;
+  void* icc;
+  size_t icc_size;
+
   VipsImage* image;
   VipsRegion* region;
   int width;
@@ -2012,6 +2026,9 @@ frames_free(JNIEnv* env, Frames* f)
   if (!f)
     return;
   frames_release_pipeline(f);
+  if (f->webp)
+    WebPAnimDecoderDelete(f->webp);
+  g_free(f->icc);
   if (f->buffer)
     env->DeleteGlobalRef(f->buffer);
   g_free(f);
@@ -2059,6 +2076,48 @@ Java_ca_mpreg_imagedecoder_ImageDecoder_nativeFrames(JNIEnv* env, jobject obj)
     if (decoder->pages < 2 || decoder->hdr_kind != HDR_NONE)
       return nullptr;
 
+    const bool webp = decoder->buffer_size >= 12 && memcmp(decoder->buffer, "RIFF", 4) == 0 &&
+                      memcmp(decoder->buffer + 8, "WEBP", 4) == 0;
+    if (webp) {
+      f = g_try_new0(Frames, 1);
+      if (!f)
+        fail(EXC_OOM, "Out of memory creating the frame decoder");
+      f->file = decoder->buffer;
+      f->file_size = decoder->buffer_size;
+
+      WebPData data = { decoder->buffer, decoder->buffer_size };
+      WebPAnimDecoderOptions options;
+      if (!WebPAnimDecoderOptionsInit(&options))
+        fail(EXC_DECODE, "WebP animation decoder unavailable");
+      options.color_mode = MODE_RGBA;
+      options.use_threads = 0;
+      f->webp = WebPAnimDecoderNew(&data, &options);
+      if (!f->webp)
+        fail(EXC_DECODE, "Invalid animated WebP");
+
+      WebPAnimInfo info;
+      if (!WebPAnimDecoderGetInfo(f->webp, &info) || info.frame_count < 2)
+        fail(EXC_DECODE, "Invalid animated WebP");
+      check_dimensions((int)info.canvas_width, (int)info.canvas_height);
+      f->width = (int)info.canvas_width;
+      f->page_height = (int)info.canvas_height;
+      f->pages = (int)info.frame_count;
+
+      /* The profile the whole decode would apply; the demuxer only borrows the file. */
+      WebPDemuxer* demux = WebPDemux(&data);
+      if (demux) {
+        WebPChunkIterator chunk;
+        if (WebPDemuxGetChunk(demux, "ICCP", 1, &chunk) && chunk.chunk.size > 0) {
+          f->icc = g_try_malloc(chunk.chunk.size);
+          if (f->icc) {
+            memcpy(f->icc, chunk.chunk.bytes, chunk.chunk.size);
+            f->icc_size = chunk.chunk.size;
+          }
+          WebPDemuxReleaseChunkIterator(&chunk);
+        }
+        WebPDemuxDelete(demux);
+      }
+    } else {
     vips::VImage header = vips::VImage::new_from_buffer(
       decoder->buffer, decoder->buffer_size, "",
       vips::VImage::option()->set("access", VIPS_ACCESS_SEQUENTIAL)->set("n", -1));
@@ -2083,6 +2142,7 @@ Java_ca_mpreg_imagedecoder_ImageDecoder_nativeFrames(JNIEnv* env, jobject obj)
     header = vips::VImage();
 
     frames_open_pipeline(f);
+    }
 
     const size_t size = checked_buffer_size((guint64)f->width * (guint64)f->page_height, 4);
     void* data = nullptr;
@@ -2143,6 +2203,20 @@ Java_ca_mpreg_imagedecoder_FrameDecoder_nativeNext(JNIEnv* env, jobject obj)
     return -1;
   }
   try {
+    if (f->webp) {
+      if (f->next >= f->pages || !WebPAnimDecoderHasMoreFrames(f->webp)) {
+        WebPAnimDecoderReset(f->webp);
+        f->next = 0;
+      }
+      uint8_t* canvas = nullptr;
+      int timestamp = 0;
+      if (!WebPAnimDecoderGetNext(f->webp, &canvas, &timestamp) || !canvas)
+        fail(EXC_DECODE, "Invalid animated WebP frame");
+      memcpy(f->out, canvas, (size_t)f->width * f->page_height * 4);
+      icc_to_srgb_rows(f->out, f->width, f->page_height, f->icc, f->icc_size);
+      return f->next++;
+    }
+
     if (f->next >= f->pages || !f->region)
       frames_open_pipeline(f);
 
